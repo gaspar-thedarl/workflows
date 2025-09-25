@@ -20,16 +20,35 @@ jobs:
       - name: Install Python deps
         run: pip install paramiko
 
-      - name: Validate required env (secrets must be set)
+      # ⬇️ NUEVO: cargar secret compuesto si existe (formato .env multilínea)
+      - name: Load composite secret (DAILY_ADDSHOPPERS) if present
         env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          SRC_USER: ${{ secrets.SRC_USER }}
-          SRC_PASS: ${{ secrets.SRC_PASS }}
-          SRC_DIR:  ${{ secrets.SRC_DIR }}
-          DST_HOST: ${{ secrets.DST_HOST }}
-          DST_USER: ${{ secrets.DST_USER }}
-          DST_PASS: ${{ secrets.DST_PASS }}
-          DST_DIR:  ${{ secrets.DST_DIR }}
+          COMPOSITE: ${{ secrets.DAILY_ADDSHOPPERS }}
+        run: |
+          if [ -n "$COMPOSITE" ]; then
+            echo "Loading env from DAILY_ADDSHOPPERS..."
+            # normalizar CRLF -> LF y exportar a GITHUB_ENV
+            echo "$COMPOSITE" | tr -d '\r' | while IFS='=' read -r k v; do
+              [ -z "$k" ] && continue
+              # evitar líneas sin '=' o comentarios
+              case "$k" in \#*|"") continue;; esac
+              echo "$k=$v" >> "$GITHUB_ENV"
+            done
+          else
+            echo "DAILY_ADDSHOPPERS not set. Expecting individual secrets instead."
+          fi
+
+      # Validación (funciona si usaste A o B)
+      - name: Validate required env (must be set by secrets)
+        env:
+          SRC_HOST: ${{ env.SRC_HOST || secrets.SRC_HOST }}
+          SRC_USER: ${{ env.SRC_USER || secrets.SRC_USER }}
+          SRC_PASS: ${{ env.SRC_PASS || secrets.SRC_PASS }}
+          SRC_DIR:  ${{ env.SRC_DIR  || secrets.SRC_DIR  }}
+          DST_HOST: ${{ env.DST_HOST || secrets.DST_HOST }}
+          DST_USER: ${{ env.DST_USER || secrets.DST_USER }}
+          DST_PASS: ${{ env.DST_PASS || secrets.DST_PASS }}
+          DST_DIR:  ${{ env.DST_DIR  || secrets.DST_DIR  }}
         run: |
           echo "Checking required env keys..."
           missing=0
@@ -40,22 +59,12 @@ jobs:
               missing=1
             else
               echo "✓ $k loaded"
+              echo "$k=$v" >> "$GITHUB_ENV"  # asegurar disponible en próximos pasos
             fi
           done
           [ "$missing" -eq 0 ] || exit 1
 
-      - name: Preflight — show hosts present (masked)
-        env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          DST_HOST: ${{ secrets.DST_HOST }}
-        run: |
-          echo "SRC_HOST set? -> ${SRC_HOST:+yes}"
-          echo "DST_HOST set? -> ${DST_HOST:+yes}"
-
       - name: Preflight — DNS resolution
-        env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          DST_HOST: ${{ secrets.DST_HOST }}
         run: |
           echo "Resolving $SRC_HOST ..."
           getent hosts "$SRC_HOST" || (echo "::error::Cannot resolve SRC_HOST=$SRC_HOST from GitHub runner" && exit 1)
@@ -64,9 +73,6 @@ jobs:
           echo "✓ DNS OK for both"
 
       - name: Preflight — TCP port 22 reachability
-        env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          DST_HOST: ${{ secrets.DST_HOST }}
         run: |
           echo "Checking TCP to $SRC_HOST:22 ..."
           nc -vz -w 5 "$SRC_HOST" 22 || (echo "::error::Cannot reach $SRC_HOST:22 (network/firewall)" && exit 1)
@@ -74,29 +80,8 @@ jobs:
           nc -vz -w 5 "$DST_HOST" 22 || (echo "::error::Cannot reach $DST_HOST:22 (network/firewall)" && exit 1)
           echo "✓ TCP 22 reachable for both"
 
-      # Opcional: quick SFTP list en el origen (no falla el job si no conecta)
-      - name: Preflight — SFTP list origin (non-fatal)
-        continue-on-error: true
-        env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          SRC_USER: ${{ secrets.SRC_USER }}
-          SRC_DIR:  ${{ secrets.SRC_DIR }}
-        run: |
-          echo "Attempting sftp ls on origin (may fail if auth disabled for OpenSSH client)..."
-          printf "ls $SRC_DIR\nbye\n" | sftp -oBatchMode=no "$SRC_USER@$SRC_HOST" || true
-
       - name: Pull (Attentive) -> Normalize -> Push (AddShoppers)
         env:
-          SRC_HOST: ${{ secrets.SRC_HOST }}
-          SRC_USER: ${{ secrets.SRC_USER }}
-          SRC_PASS: ${{ secrets.SRC_PASS }}
-          SRC_DIR:  ${{ secrets.SRC_DIR }}
-
-          DST_HOST: ${{ secrets.DST_HOST }}
-          DST_USER: ${{ secrets.DST_USER }}
-          DST_PASS: ${{ secrets.DST_PASS }}
-          DST_DIR:  ${{ secrets.DST_DIR }}
-
           DATE_OVERRIDE: ${{ github.event.inputs.date_override }}
         run: |
           python - <<'PY'
@@ -164,16 +149,14 @@ jobs:
               for e in sorted(seen): w.write(e + "\n")
             return total_in, len(seen)
 
-          # ===== Env =====
           SRC_HOST=os.environ['SRC_HOST']; SRC_USER=os.environ['SRC_USER']; SRC_PASS=os.environ['SRC_PASS']; SRC_DIR=os.environ['SRC_DIR']
           DST_HOST=os.environ['DST_HOST']; DST_USER=os.environ['DST_USER']; DST_PASS=os.environ['DST_PASS']; DST_DIR=os.environ['DST_DIR']
           date_override=os.environ.get('DATE_OVERRIDE','').strip()
 
-          # Nombre Attentive: ableclothing_attentive_email_SMS_YYYYMMDD.csv
           PREFIX = "ableclothing_attentive_email_SMS_"
           yyyymmdd = date_override if date_override else date.today().strftime("%Y%m%d")
 
-          # ===== 1) PULL (Attentive) =====
+          # 1) Pull origen
           src, t1 = sftp_connect(SRC_HOST, SRC_USER, SRC_PASS)
           try:
             src.chdir(SRC_DIR)
@@ -185,18 +168,18 @@ jobs:
           finally:
             t1.close()
 
-          # ===== 2) NORMALIZE =====
+          # 2) Normalize
           local_out = f"work/{src_name}"
           total_in, total_out = normalize_any_to_single_column(local_in, local_out)
           print(f"Normalized: {total_out} valid emails out of ~{total_in} lines/cells")
 
-          # ===== 3) PUSH (AddShoppers) =====
+          # 3) Push destino
           dst, t2 = sftp_connect(DST_HOST, DST_USER, DST_PASS)
           try:
             try:
-              dst.chdir(DST_DIR)          # relativo al home (p.ej. 'upload-here')
+              dst.chdir(DST_DIR)
             except IOError:
-              dst.chdir(f"/{DST_DIR}")    # fallback absoluto (p.ej. '/upload-here')
+              dst.chdir(f"/{DST_DIR}")
             dst.put(local_out, os.path.basename(local_out))
             print(f"Uploaded to {DST_HOST}:{DST_DIR}/{os.path.basename(local_out)}")
           finally:
