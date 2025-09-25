@@ -1,0 +1,134 @@
+name: Daily suppression transfer
+
+on:
+  schedule:
+    - cron: "15 6 * * *"   # corre diario
+  workflow_dispatch:
+    inputs:
+      date_override:
+        description: "Fecha YYYYMMDD (opcional para probar)"
+        required: false
+        default: ""
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prepare workspace
+        run: mkdir -p work
+
+      - name: Install Python deps
+        run: pip install paramiko
+
+      - name: Pull (Attentive) -> Normalize -> Push (AddShoppers)
+        env:
+          SRC_HOST: ${{ secrets.SRC_HOST }}
+          SRC_USER: ${{ secrets.SRC_USER }}
+          SRC_PASS: ${{ secrets.SRC_PASS }}
+          SRC_DIR:  ${{ secrets.SRC_DIR }}
+
+          DST_HOST: ${{ secrets.DST_HOST }}
+          DST_USER: ${{ secrets.DST_USER }}
+          DST_PASS: ${{ secrets.DST_PASS }}
+          DST_DIR:  ${{ secrets.DST_DIR }}
+
+          DATE_OVERRIDE: ${{ github.event.inputs.date_override }}
+        run: |
+          python - <<'PY'
+          import os, re, csv
+          from datetime import date
+          import paramiko
+
+          def sftp_connect(host, user, password):
+            t = paramiko.Transport((host, 22))
+            t.connect(username=user, password=password)
+            return paramiko.SFTPClient.from_transport(t), t
+
+          def pick_filename(entries, prefix, yyyymmdd):
+            expected = f"{prefix}{yyyymmdd}.csv"
+            names = [e.filename for e in entries]
+            if expected in names:
+              return expected
+            candidates = [e for e in entries if e.filename.startswith(prefix) and e.filename.endswith(".csv")]
+            if not candidates:
+              return max(entries, key=lambda e: e.st_mtime).filename
+            return max(candidates, key=lambda e: e.st_mtime).filename
+
+          def normalize_any_to_single_column(in_path, out_path):
+            email_re = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+            seen = set(); total_in = 0
+            try:
+              with open(in_path, encoding="utf-8", errors="ignore", newline="") as f:
+                sample = f.read(4096); f.seek(0)
+                is_csvish = ("," in sample) or ('"' in sample)
+                if is_csvish:
+                  reader = csv.reader(f)
+                  header = None; first = True; email_idx = None
+                  for row in reader:
+                    if not row: continue
+                    if first:
+                      header = [c.strip().lower() for c in row]; first = False
+                      for i, h in enumerate(header):
+                        if h == 'email' or h.startswith('email'):
+                          email_idx = i; break
+                      if email_idx is not None: continue
+                      for cell in header:
+                        e = cell.strip().lower()
+                        if email_re.match(e): seen.add(e)
+                      continue
+                    total_in += 1
+                    if email_idx is not None and email_idx < len(row):
+                      e = row[email_idx].strip().lower()
+                      if email_re.match(e): seen.add(e)
+                    else:
+                      for c in row:
+                        e = c.strip().lower()
+                        if email_re.match(e): seen.add(e)
+                else:
+                  for line in f:
+                    total_in += 1
+                    e = line.strip().lower()
+                    if email_re.match(e): seen.add(e)
+            except Exception:
+              with open(in_path, encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                  total_in += 1
+                  e = line.strip().lower()
+                  if email_re.match(e): seen.add(e)
+            with open(out_path, "w", encoding="utf-8", newline="") as w:
+              for e in sorted(seen): w.write(e + "\n")
+            return total_in, len(seen)
+
+          SRC_HOST=os.environ['SRC_HOST']; SRC_USER=os.environ['SRC_USER']; SRC_PASS=os.environ['SRC_PASS']; SRC_DIR=os.environ['SRC_DIR']
+          DST_HOST=os.environ['DST_HOST']; DST_USER=os.environ['DST_USER']; DST_PASS=os.environ['DST_PASS']; DST_DIR=os.environ['DST_DIR']
+          date_override=os.environ.get('DATE_OVERRIDE','').strip()
+
+          PREFIX = "ableclothing_attentive_email_SMS_"
+          yyyymmdd = date_override if date_override else date.today().strftime("%Y%m%d")
+
+          src, t1 = sftp_connect(SRC_HOST, SRC_USER, SRC_PASS)
+          try:
+            src.chdir(SRC_DIR)
+            entries = src.listdir_attr(".")
+            src_name = pick_filename(entries, PREFIX, yyyymmdd)
+            local_in = f"work/{src_name}"
+            src.get(src_name, local_in)
+            print(f"Pulled: {src_name}")
+          finally:
+            t1.close()
+
+          local_out = f"work/{src_name}"
+          total_in, total_out = normalize_any_to_single_column(local_in, local_out)
+          print(f"Normalized: {total_out} valid emails out of ~{total_in} lines/cells")
+
+          dst, t2 = sftp_connect(DST_HOST, DST_USER, DST_PASS)
+          try:
+            try:
+              dst.chdir(DST_DIR)
+            except IOError:
+              dst.chdir(f"/{DST_DIR}")
+            dst.put(local_out, os.path.basename(local_out))
+            print(f"Uploaded to {DST_HOST}:{DST_DIR}/{os.path.basename(local_out)}")
+          finally:
+            t2.close()
+          PY
