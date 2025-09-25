@@ -1,0 +1,78 @@
+name: Daily suppression transfer
+
+on:
+  schedule:
+    - cron: '15 6 * * *' # 06:15 UTC ≈ 03:15 ART
+  workflow_dispatch:
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (empty)
+        run: mkdir -p work
+
+      - name: Install deps
+        run: pip install paramiko
+
+      - name: Run transfer
+        env:
+          SRC_HOST: ${{ secrets.SRC_HOST }}
+          SRC_USER: ${{ secrets.SRC_USER }}
+          SRC_PASS: ${{ secrets.SRC_PASS }}
+          SRC_DIR:  ${{ secrets.SRC_DIR }}
+          DST_HOST: sftp.addshoppers.com
+          DST_USER: spl_ableclothing
+          DST_PASS: ${{ secrets.DST_PASS }}
+          DST_DIR:  upload-here
+        run: |
+          python - <<'PY'
+          import os, re, sys
+          import paramiko
+          from datetime import date
+
+          def sftp_connect(host,user,password):
+            t = paramiko.Transport((host,22))
+            t.connect(username=user, password=password)
+            return paramiko.SFTPClient.from_transport(t), t
+
+          SRC_HOST=os.environ['SRC_HOST']; SRC_USER=os.environ['SRC_USER']; SRC_PASS=os.environ['SRC_PASS']; SRC_DIR=os.environ['SRC_DIR']
+          DST_HOST=os.environ['DST_HOST']; DST_USER=os.environ['DST_USER']; DST_PASS=os.environ['DST_PASS']; DST_DIR=os.environ['DST_DIR']
+
+          # 1) Conectar origen y elegir archivo del día (por nombre con fecha)
+          today=date.today().isoformat()
+          src, t1 = sftp_connect(SRC_HOST, SRC_USER, SRC_PASS)
+          src.chdir(SRC_DIR)
+          candidates = [f.filename for f in src.listdir_attr('.') if today in f.filename]
+          if not candidates:
+            # Fallback: elegí el más nuevo por mtime
+            entries = src.listdir_attr('.')
+            candidates = [max(entries, key=lambda e: e.st_mtime).filename]
+
+          src_file = sorted(candidates)[-1]
+          local_in = f"work/{src_file}"
+          src.get(src_file, local_in)
+
+          # 2) Normalizar
+          out = f"work/suppression_{today}.csv"
+          import csv
+          import re
+          seen=set()
+          email_re=re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+          with open(local_in, encoding='utf-8', errors='ignore') as f, open(out,'w',encoding='utf-8',newline='') as w:
+            for line in f:
+              e=line.strip().lower()
+              if email_re.match(e) and e not in seen:
+                seen.add(e); w.write(e+'\n')
+
+          # 3) Subir destino
+          dst, t2 = sftp_connect(DST_HOST, DST_USER, DST_PASS)
+          try:
+            dst.chdir(DST_DIR)
+          except IOError:
+            dst.mkdir(DST_DIR); dst.chdir(DST_DIR)
+          dst.put(out, os.path.basename(out))
+
+          t1.close(); t2.close()
+          print("OK uploaded", out)
+          PY
